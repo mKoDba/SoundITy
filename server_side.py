@@ -11,6 +11,8 @@ from operator import itemgetter
 import os
 import glob
 import pickle
+import json
+import io
 
 
 def get_peaks_skimage(data):
@@ -20,32 +22,28 @@ def get_peaks_skimage(data):
 
 # <nfft>/2 frequency bins are split logarithmically into <nbins> frequency bands
 def generate_bins(nbins, nfft):
-    bands = [0]
-    for i in range(int(np.log2(nfft)) - nbins, int(np.log2(nfft))):
-        bands.append(2**i)
+    # TODO change these hardcoded bands, currently suitable for nfft = 1024
+    bands = [0, 10, 20, 40, 80, 160, 511]
     print("freq bands:", bands)
     return bands
 
 
 def prune_peaks(peaks, freq_bins, time_size=50):
     # Number of time slices for each segment to filter
-    curr_time = time_size
+    curr_time_segment = time_size
     pruned_peaks = []
-    tmp_peaks = defaultdict(list)
-    ampl_coeff = 1.5
+    tmp_peaks = []
+    ampl_coef = 1
     for peak in peaks:
         # After we iterate over <time_size> slices, find mean and filter
-        if peak.time > curr_time:
-            for binned_peaks in tmp_peaks.values():
-                if len(binned_peaks) != 0:
-                    mean_amplitude = np.mean([p.amplitude for p in binned_peaks])
-                    pruned_peaks += list(filter(lambda p: p.amplitude > mean_amplitude*ampl_coeff, binned_peaks))
-                    #pruned_peaks += [x for x in binned_peaks if x.amplitude >= mean_amplitude*ampl_coeff]
+        if peak.time > curr_time_segment:
+            mean_amplitude = np.mean([p.amplitude for p in tmp_peaks])
+            [pruned_peaks.append(p) for p in tmp_peaks if p.amplitude >= mean_amplitude]
             tmp_peaks.clear()
-            curr_time += time_size
+            curr_time_segment += time_size
         # If still on current segment, add segment peaks
-        tmp_peaks[np.searchsorted(freq_bins, peak.freq, side='right')].append(peak)
-    print("no. of prunned peaks:", len(pruned_peaks))
+        tmp_peaks.append(peak)
+    print("no. of pruned peaks:", len(pruned_peaks))
 
     return pruned_peaks
 
@@ -53,13 +51,32 @@ def prune_peaks(peaks, freq_bins, time_size=50):
 def find_peaks(spec_data, nfft):
     Peak = namedtuple('Peak', ['amplitude', 'freq', 'time'])
     peaks = []
-    time_slice = 0
-    no_bins = 6
-    freq_bins = generate_bins(no_bins, nfft)
+    no_bands = 6
+    freq_bins = generate_bins(no_bands, nfft)
     # Shape returns (n,m) where n - number of rows, m - number of columns
-    # In <specData>, frequency bins increase down the rows, time slices increase across the columns
+    # In <spec_data>, frequency bins increase down the rows, time slices increase across the columns
     # Get each time slice (column) and its neighbours
-    for i in range(1, spec_data.shape[1] - 1):
+    for time_slice in range(1, spec_data.shape[1] - 1):
+        #tmp_peaks = defaultdict(list)
+        tmp_peaks = []
+        time_slice_mean = 0
+
+        for j in range(0, no_bands):
+            curr_band = [freq_bins[j], freq_bins[j+1]]
+            curr_fft = spec_data[curr_band[0]:curr_band[1], time_slice]
+            # get index of strongest bin in current frequency band
+            index = np.argmax(curr_fft)
+            time_slice_mean += curr_fft[index]
+            peak = Peak(amplitude=curr_fft[index], freq=curr_band[0]+index, time=time_slice)
+            #tmp_peaks[np.searchsorted(freq_bins, peak.freq, side='right')].append(peak)
+            tmp_peaks.append(peak)
+
+        # Keep only bins above time slice mean
+        time_slice_mean /= no_bands
+        [peaks.append(p) for p in tmp_peaks if p.amplitude >= time_slice_mean]
+
+
+    '''
         fft_prev = spec_data[:, i-1]
         fft = spec_data[:, i]
         fft_next = spec_data[:, i+1]
@@ -94,7 +111,9 @@ def find_peaks(spec_data, nfft):
                 peaks.append(p)
         tmp_peaks.clear()
         bin_peaks.clear()
-        time_slice += 1
+        time_slice += 1 
+    '''
+
     # Now we have filtered spectrogram points that can be further
     # optimized by taking number of time slices (instead of one at the time)
     # and calculating its average amplitude and then applying same method as above
@@ -103,9 +122,9 @@ def find_peaks(spec_data, nfft):
 
     # Amplitudes are not needed anymore, therefore we can omit them
     # and we will sort points by increasing time and then frequency
-
     filtered_peaks = [(p.time, p.freq) for p in pruned_peaks]
     filtered_peaks.sort(key=itemgetter(0, 1))
+    #print(filtered_peaks)
 
     return filtered_peaks
 
@@ -113,21 +132,19 @@ def find_peaks(spec_data, nfft):
 # <peaks> is now list of (time, freq) tuples
 def generate_fingerprints(peaks, song_id):
     # More points <zone_size> in each target zone could
-    # increase efficiency but also increase search time
+    # increase accuracy but also increase search time
     zone_size = 5
     target_zones = []
-    # Each target zone overlaps with previous in zoneSize - 1 points
-    for i in range(0, len(peaks) - zone_size, 1):
-        target_zones.append(peaks[i:i+zone_size])
+    delay = 3
 
-    # Now we generate "addresses" using anchor point for each target zone,
-    # address tuple format will be: (<anchor_freq>, <point_freq>, <dt>)
-    # where dt is delta time between anchor and point
     # We skip first <delay> target zones (TZ) because their anchor could
     # not be located properly, but there should be enough fingerprints
     # even without it
-    delay = 3
     fingerprints = []
+    # Each target zone overlaps with previous in zone_size - 1 points
+    for i in range(delay, len(peaks) - zone_size, 1):
+        target_zones.append(peaks[i:i+zone_size])
+
     '''
     anchor_time = peaks[0][0]
     anchor_freq = peaks[0][1]
@@ -139,17 +156,20 @@ def generate_fingerprints(peaks, song_id):
             address = (anchor_freq, p_freq, p_time-anchor_time)
             fingerprints.append((address, (song_id, anchor_time)))
     '''
-    # Now we can generate fingerprint with anchor point which is 3 points before
+    # Now we generate "addresses" using anchor point for each target zone,
+    # address tuple format will be: (<anchor_freq>, <point_freq>, <dt>)
+    # where dt is delta time between anchor and point
+    # We can generate fingerprint with anchor point which is 3 points before
     # start point of each TZ
-    for t in range(delay, len(target_zones) - 1):
+    for t in range(0, len(target_zones) - 1):
         target_zone = target_zones[t]
-        anchor = peaks[t-delay]
+        anchor = peaks[t]
         anchor_time = anchor[0]
         anchor_freq = anchor[1]
-        for p in target_zone:
-            p_time = p[0]
-            p_freq = p[1]
-            address = (anchor_freq, p_freq, p_time-anchor_time)
+        for point in target_zone:
+            point_time = point[0]
+            point_freq = point[1]
+            address = (anchor_freq, point_freq, point_time-anchor_time)
             fingerprints.append((address, (song_id, anchor_time)))
 
     # return list of tuples (<address>, (<song_id>, <anchor_time>))
@@ -195,6 +215,7 @@ def main():
 
     # TODO add error checking for file type and missing files
     id = 0
+    all_hash_tables = []
     for song in glob.glob(os.path.join(file_path, '*.wav')):
         print(song)
         # Read .wav file and convert it to mono channel
@@ -205,7 +226,9 @@ def main():
         # Decimation - apply AA filter and the downsample by factor q
         signal_data = signal.decimate(signal_data, q=4, ftype='fir')
 
-        nfft = 256
+        nfft = 1024
+        # Frequency resolution of spectrogram is given by formula (fs / q) / nfft,
+        # defaults to (44100 / 4) / 1024 ~ 10.8 Hz
         # Plots Pxx = 10*log10(abs(Sxx)), where Sxx = Zxx**2 (Zxx returned by signal.stft)
         # Power Spectral Density plot
         pxx, f, t, im = plt.specgram(signal_data,
@@ -223,13 +246,19 @@ def main():
             plt.show()
 
         peaks = find_peaks(pxx, nfft)
-        fingerprints = generate_fingerprints(peaks, song_id=song)
+        fingerprints = generate_fingerprints(peaks, song_id=id)
         hash_table = generate_hashtable(fingerprints)
-
-        with open('database.sz', 'wb') as file:
-            pickle.dump(hash_table, file)
+        all_hash_tables.append(hash_table)
         id += 1
-        print("Done")
+
+    # Merge all hash tables into one and make database file from it
+    super_dict = defaultdict(list)
+    for ht in all_hash_tables:
+        for k, v in ht.items():
+            super_dict[k].append(v)
+
+    with open('database.sz', 'wb') as file:
+        pickle.dump(super_dict, file)
 
     return
 
