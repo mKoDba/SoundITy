@@ -1,27 +1,17 @@
-import datetime
 import numpy as np
 import matplotlib.pyplot as plt
-import matplotlib.ticker as tick
 from scipy.io import wavfile
 from scipy import signal
 import argparse
-from skimage.feature import peak_local_max
 from collections import namedtuple, defaultdict, Counter
 from operator import itemgetter
 import os
 import glob
 import pickle
-import json
-import io
-
-
-def get_peaks_skimage(data):
-    peaks = peak_local_max(data, min_distance=50)
-    return peaks
 
 
 # <nfft>/2 frequency bins are split logarithmically into <nbins> frequency bands
-def generate_bins(nbins, nfft):
+def generate_bands(nbands, nfft):
     # TODO change these hardcoded bands, currently suitable for nfft = 1024
     bands = [0, 10, 20, 40, 80, 160, 511]
     print("freq bands:", bands)
@@ -38,7 +28,7 @@ def prune_peaks(peaks, freq_bins, time_size=50):
         # After we iterate over <time_size> slices, find mean and filter
         if peak.time > curr_time_segment:
             mean_amplitude = np.mean([p.amplitude for p in tmp_peaks])
-            [pruned_peaks.append(p) for p in tmp_peaks if p.amplitude >= mean_amplitude]
+            [pruned_peaks.append(p) for p in tmp_peaks if p.amplitude >= mean_amplitude*ampl_coef]
             tmp_peaks.clear()
             curr_time_segment += time_size
         # If still on current segment, add segment peaks
@@ -52,12 +42,11 @@ def find_peaks(spec_data, nfft):
     Peak = namedtuple('Peak', ['amplitude', 'freq', 'time'])
     peaks = []
     no_bands = 6
-    freq_bins = generate_bins(no_bands, nfft)
+    freq_bins = generate_bands(no_bands, nfft)
     # Shape returns (n,m) where n - number of rows, m - number of columns
     # In <spec_data>, frequency bins increase down the rows, time slices increase across the columns
     # Get each time slice (column) and its neighbours
     for time_slice in range(1, spec_data.shape[1] - 1):
-        #tmp_peaks = defaultdict(list)
         tmp_peaks = []
         time_slice_mean = 0
 
@@ -68,51 +57,11 @@ def find_peaks(spec_data, nfft):
             index = np.argmax(curr_fft)
             time_slice_mean += curr_fft[index]
             peak = Peak(amplitude=curr_fft[index], freq=curr_band[0]+index, time=time_slice)
-            #tmp_peaks[np.searchsorted(freq_bins, peak.freq, side='right')].append(peak)
             tmp_peaks.append(peak)
 
         # Keep only bins above time slice mean
         time_slice_mean /= no_bands
         [peaks.append(p) for p in tmp_peaks if p.amplitude >= time_slice_mean]
-
-
-    '''
-        fft_prev = spec_data[:, i-1]
-        fft = spec_data[:, i]
-        fft_next = spec_data[:, i+1]
-        # Iterate over each frequency bin:
-        # in order to be classified as local maxima,
-        # fft needs to be larger than its four neighbours
-        tmp_peaks = defaultdict(list)
-        for j in range(1, freq_bins[-1]):
-            if(fft[j] > fft[j-1] and
-               fft[j] > fft[j+1] and
-               fft[j] > fft_prev[j] and
-               fft[j] > fft_next[j]):
-                peak = Peak(amplitude=fft[j], freq=j, time=time_slice)
-                # Create key-value pair, in which key is one of nbins freq bins
-                # and value is an array of Peak namedtuples
-                tmp_peaks[np.searchsorted(freq_bins, peak.freq, side='right')].append(peak)
-        # Find max value out of possible (local maximas)
-        # for each of created <nbins> (logarithmic) freq bins
-        bin_peaks = [max(x, key=lambda p: p.amplitude) for x in tmp_peaks.values()]
-        # Out of this <nbins> or less powerful amplitudes,
-        # find the mean value and keep only bins above this mean value
-        if len(bin_peaks) == 0:
-            continue
-        mean_amplitude = np.mean([p.amplitude for p in bin_peaks])
-        amplitude_coeff = 1.5
-        for p in bin_peaks:
-            # TODO: find optimal value for amplCoefficient
-            # Some parts of the song are very quiet, e.g. beginning or ending,
-            # which will cause low mean value compared to rest of the song and
-            # false 'high amplitude' frequencies, <amplitude_coeff> can help with that
-            if p.amplitude >= mean_amplitude*amplitude_coeff:
-                peaks.append(p)
-        tmp_peaks.clear()
-        bin_peaks.clear()
-        time_slice += 1 
-    '''
 
     # Now we have filtered spectrogram points that can be further
     # optimized by taking number of time slices (instead of one at the time)
@@ -124,7 +73,6 @@ def find_peaks(spec_data, nfft):
     # and we will sort points by increasing time and then frequency
     filtered_peaks = [(p.time, p.freq) for p in pruned_peaks]
     filtered_peaks.sort(key=itemgetter(0, 1))
-    #print(filtered_peaks)
 
     return filtered_peaks
 
@@ -145,17 +93,6 @@ def generate_fingerprints(peaks, song_id):
     for i in range(delay, len(peaks) - zone_size, 1):
         target_zones.append(peaks[i:i+zone_size])
 
-    '''
-    anchor_time = peaks[0][0]
-    anchor_freq = peaks[0][1]
-    for t in range(0, delay):
-        target_zone = target_zones[t]
-        for p in target_zone:
-            p_time = p[0]
-            p_freq = p[1]
-            address = (anchor_freq, p_freq, p_time-anchor_time)
-            fingerprints.append((address, (song_id, anchor_time)))
-    '''
     # Now we generate "addresses" using anchor point for each target zone,
     # address tuple format will be: (<anchor_freq>, <point_freq>, <dt>)
     # where dt is delta time between anchor and point
@@ -195,7 +132,6 @@ def main():
     text = "Spectrogram module allows for computing and plotting spectrogram from .wav file"
     parser = argparse.ArgumentParser(description=text)
     parser.add_argument("-p", "--plot", help="Plot spectrogram of given .wav file")
-    parser.add_argument("-d", "--data", help="Compute spectrogram data of given .wav file")
     parser.add_argument("-c", "--create", help="Create database of recognizable songs")
     args = parser.parse_args()
     plot_spec = False
@@ -203,9 +139,6 @@ def main():
         print("Plotting spectrogram of %s" % args.plot)
         file_path = args.plot
         plot_spec = True
-    elif args.data:
-        print("Creating spectrogram data for %s" % args.data)
-        file_path = args.data
     elif args.create:
         print("Creating database of songs...")
         file_path = args.create
@@ -214,7 +147,7 @@ def main():
         return
 
     # TODO add error checking for file type and missing files
-    id = 0
+    song_id = 0
     all_hash_tables = []
     for song in glob.glob(os.path.join(file_path, '*.wav')):
         print(song)
@@ -246,10 +179,10 @@ def main():
             plt.show()
 
         peaks = find_peaks(pxx, nfft)
-        fingerprints = generate_fingerprints(peaks, song_id=id)
+        fingerprints = generate_fingerprints(peaks, song_id=song_id)
         hash_table = generate_hashtable(fingerprints)
         all_hash_tables.append(hash_table)
-        id += 1
+        song_id += 1
 
     # Merge all hash tables into one and make database file from it
     super_dict = defaultdict(list)
@@ -257,7 +190,7 @@ def main():
         for k, v in ht.items():
             super_dict[k].append(v)
 
-    with open('database.sz', 'wb') as file:
+    with open('database.sound', 'wb') as file:
         pickle.dump(super_dict, file)
 
     return

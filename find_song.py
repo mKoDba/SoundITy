@@ -26,7 +26,7 @@ def prune_peaks(peaks, freq_bins, time_size=50):
         # After we iterate over <time_size> slices, find mean and filter
         if peak.time > curr_time_segment:
             mean_amplitude = np.mean([p.amplitude for p in tmp_peaks])
-            [pruned_peaks.append(p) for p in tmp_peaks if p.amplitude >= mean_amplitude]
+            [pruned_peaks.append(p) for p in tmp_peaks if p.amplitude >= mean_amplitude*ampl_coef]
             tmp_peaks.clear()
             curr_time_segment += time_size
         # If still on current segment, add segment peaks
@@ -45,7 +45,6 @@ def find_peaks(spec_data, nfft):
     # In <spec_data>, frequency bins increase down the rows, time slices increase across the columns
     # Get each time slice (column) and its neighbours
     for time_slice in range(1, spec_data.shape[1] - 1):
-        #tmp_peaks = defaultdict(list)
         tmp_peaks = []
         time_slice_mean = 0
 
@@ -56,7 +55,6 @@ def find_peaks(spec_data, nfft):
             index = np.argmax(curr_fft)
             time_slice_mean += curr_fft[index]
             peak = Peak(amplitude=curr_fft[index], freq=curr_band[0]+index, time=time_slice)
-            #tmp_peaks[np.searchsorted(freq_bins, peak.freq, side='right')].append(peak)
             tmp_peaks.append(peak)
 
         # Keep only bins above time slice mean
@@ -73,7 +71,6 @@ def find_peaks(spec_data, nfft):
     # and we will sort points by increasing time and then frequency
     filtered_peaks = [(p.time, p.freq) for p in pruned_peaks]
     filtered_peaks.sort(key=itemgetter(0, 1))
-    #print(filtered_peaks)
 
     return filtered_peaks
 
@@ -162,7 +159,7 @@ def find_song(record, database):
 
 def main():
     # Initiate the parser
-    text = "find_song module tries to find song in database given input .wav file"
+    text = "find_song module tries to find song in database with given input .wav file"
     parser = argparse.ArgumentParser(description=text)
     parser.add_argument("-f", "--find", help="Find song info")
     args = parser.parse_args()
@@ -171,10 +168,15 @@ def main():
     if signal_data.ndim == 2:
         signal_data = np.mean(signal_data, axis=1)
 
-    # Decimation - apply AA filter and the downsample by factor q
-    signal_data = signal.decimate(signal_data, q=4, ftype='fir')
+    # Decimation - apply AA filter and then downsample by factor q
+    if fs == 44100 or fs == 48000:
+        signal_data = signal.decimate(signal_data, q=4, ftype='fir')
+    elif fs == 22050:
+        signal_data = signal.decimate(signal_data, q=2, ftype='fir')
 
+    # For now keep FFT window size of 1024 hardcoded
     nfft = 1024
+
     # Needed only for spectrogram data, not really interested in plotting now
     pxx, f, t, im = plt.specgram(signal_data,
                                  NFFT=nfft,
@@ -188,7 +190,7 @@ def main():
     song_hash_table = generate_hashtable(fingerprints)
 
     # Open database of known songs
-    with open('database.sz', 'rb') as db:
+    with open('database.sound', 'rb') as db:
         database = pickle.load(db)
 
     print("Database loaded")
